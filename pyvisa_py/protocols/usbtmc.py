@@ -290,7 +290,10 @@ class USBTMC(USBRaw):
         )
 
         self.usb_dev.reset()
-        self.usb_dev.set_configuration()
+
+        # Do not re-configure if super() did so
+        if self.usb_dev.get_active_configuration() is None:
+            self.usb_dev.set_configuration()
 
         time.sleep(0.01)
 
