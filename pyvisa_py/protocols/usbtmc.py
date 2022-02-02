@@ -14,6 +14,7 @@ import enum
 import struct
 import time
 import warnings
+import logging
 from collections import namedtuple
 
 import usb
@@ -435,6 +436,7 @@ class USBTMC(USBRaw):
 
             eom = end >= size
             data = BulkOutMessage.build_array(self._btag, eom, data[begin:end])
+            logging.debug(f"-> DATA (len={len(data)})" + str([f"0x{x:02x}" for x in data]))
 
             bytes_sent += raw_write(data)
 
@@ -449,6 +451,7 @@ class USBTMC(USBRaw):
         header_size = 12
         max_padding = 511
 
+        ignore_eom = False
         eom = False
 
         raw_read = super(USBTMC, self).read
@@ -456,25 +459,57 @@ class USBTMC(USBRaw):
 
         received = bytearray()
 
+        transfer_size = None
+        bytesleft = None
         while not eom:
+
             self._btag = (self._btag % 255) + 1
-
             req = BulkInMessage.build_array(self._btag, recv_chunk, None)
-
             raw_write(req)
 
             try:
-                resp = raw_read(recv_chunk + header_size + max_padding)
-                response = BulkInMessage.from_bytes(resp)
+                in_data = raw_read(recv_chunk + header_size + max_padding)
+
+                if transfer_size is None:
+                    # First transfer IN transaction, so we'll get a full header
+                    response = BulkInMessage.from_bytes(in_data)
+                    transaction_data = response.data
+                    transfer_size = bytesleft = response.transfer_size
+
+                    # Section 3.3.1.1
+                    # The Host must ignore EOM if the device does not send TransferSize message data bytes.
+                    ignore_eom = response.transfer_size > len(transaction_data)
+                else:
+                    # Subsequent transactions can be only data bytes and padding, so fake out a response
+                    response = None
+                    transaction_data = in_data
+
+                logging.debug(f"<- HEADER " + ('N/A' if response is None else str([f"0x{x:02x}" for x in in_data[:12]])))
+                logging.debug(f"<- DATA (len={len(transaction_data)})" + str([f"0x{x:02x}" for x in transaction_data]))
+                logging.debug(f"<- RESP {'N/A' if response is None else str(response)}")
+
+                if len(transaction_data) > bytesleft:
+                    alignment_len = len(transaction_data) - bytesleft
+                    if alignment_len > 3:
+                        warnings.warn(f"Should never see more than 3 padding bytes in data, but saw {alignment_len}")
+                    transaction_data = transaction_data[:bytesleft]  # Strip off any alignment bytes
+                    bytesleft = 0
+                else:
+                    bytesleft -= len(transaction_data)
+
             except (usb.core.USBError, ValueError):
                 # Abort failed Bulk-IN operation.
                 self._abort_bulk_in(self._btag)
                 raise
 
-            received.extend(response.data)
+            received.extend(transaction_data)
 
             # Detect EOM only when device sends all expected bytes.
-            if len(response.data) >= response.transfer_size:
-                eom = response.transfer_attributes & 1
+            logging.debug(f"RECV {len(received)} of {transfer_size} bytes")
+            if len(received) >= transfer_size:
+                if ignore_eom:
+                    eom = True
+                else:
+                    eom = response.transfer_attributes & 1
 
         return bytes(received)
